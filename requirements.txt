@@ -1,0 +1,4 @@
+Flask==3.0.3
+python-telegram-bot==13.15
+tldextract==5.1.2
+gunicorn==23.0.0
