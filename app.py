@@ -19,12 +19,10 @@ from telegram.ext import (
 # ----------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # Render sets this automatically
+WEB_BASE_URL = RENDER_URL or os.environ.get("WEB_BASE_URL", "")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var")
-
-# If you're not on Render you can set WEB_BASE_URL manually (e.g. https://your-domain)
-WEB_BASE_URL = RENDER_URL or os.environ.get("WEB_BASE_URL", "")
 
 # ----------------------------
 # Flask
@@ -35,10 +33,7 @@ app = Flask(__name__)
 # PTB v21 Application (async)
 # ----------------------------
 application = Application.builder().token(BOT_TOKEN).build()
-
-# We'll run PTB's asyncio loop in a background thread
 _loop = asyncio.new_event_loop()
-
 
 # ----------------------------
 # URL helpers
@@ -81,22 +76,20 @@ def extract_urls(text: str):
             out.append(s)
     return out
 
-def clean_pairs(text: str):
+def clean_sites(text: str):
     """
-    Returns list of (normalized_url, apex_site) pairs.
-    - normalized_url: original with https:// added if missing
-    - apex_site: https://<registrable-domain>
-    De-duplicated by normalized_url.
+    Returns a de-duplicated list of apex sites as https://<domain>.
+    Example output lines:
+      https://example.com
+      https://amazon.co.uk
     """
-    pairs, seen = [], set()
+    sites, seen = [], set()
     for u in extract_urls(text):
-        norm = normalize_input_url(u)
-        if not norm or norm in seen:
-            continue
-        seen.add(norm)
-        pairs.append((norm, to_apex_site(norm)))
-    return pairs
-
+        site = to_apex_site(u)
+        if site and site not in seen:
+            seen.add(site)
+            sites.append(site)
+    return sites
 
 # ----------------------------
 # Handlers (async)
@@ -109,10 +102,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Or upload a `.txt` file with URLs\n\n"
         "I will:\n"
         "✅ Add `https://` if missing\n"
-        "✅ Extract the clean apex domain\n"
+        "✅ Trim each link to the clean site (apex domain)\n"
         "✅ Remove duplicates\n"
-        "✅ Return a `urls.txt` mapping like:\n"
-        "`https://example.com/path -> https://example.com`",
+        "✅ Return a `urls.txt` with *one clean site per line*.\n\n"
+        "*Example:*\n"
+        "`https://zero936.com/abc` → `https://zero936.com`",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -121,29 +115,26 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *How to Use*\n\n"
         "1) Send text with links OR upload a `.txt` file (≤10MB)\n"
         "2) I will:\n"
-        "   • Add `https://` if missing\n"
-        "   • Clean to main domain (apex)\n"
-        "   • Remove duplicates\n"
-        "   • Reply with `urls.txt`\n\n"
-        "*Example:*\n"
-        "`shop.amazon.co.uk/book` → `https://amazon.co.uk`",
+        "   • Normalize with `https://` if missing\n"
+        "   • Collapse to the apex domain\n"
+        "   • De-duplicate\n"
+        "   • Reply with `urls.txt` (one domain per line)\n\n"
+        "*Example output:*\n"
+        "`https://zero936.com`",
         parse_mode=ParseMode.MARKDOWN
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    pairs = clean_pairs(text)
-    if not pairs:
-        await update.message.reply_text("No URLs found.")
+    sites = clean_sites(update.message.text or "")
+    if not sites:
+        await update.message.reply_text("No site URLs found.")
         return
 
-    lines = [f"{norm} -> {site}" for (norm, site) in pairs]
-    buf = BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+    buf = BytesIO(("\n".join(sites) + "\n").encode("utf-8"))
     buf.seek(0)
-
     await update.message.reply_document(
         document=buf, filename="urls.txt",
-        caption=f"✅ Processed {len(pairs)} URL(s)."
+        caption=f"✅ Extracted {len(sites)} clean site(s)."
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -170,27 +161,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Couldn't read that file. Please try again.")
         return
 
-    pairs = clean_pairs(content)
-    if not pairs:
-        await update.message.reply_text("No URLs found in your file.")
+    sites = clean_sites(content)
+    if not sites:
+        await update.message.reply_text("No site URLs found in your file.")
         return
 
-    lines = [f"{norm} -> {site}" for (norm, site) in pairs]
-    outbuf = BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
-    outbuf.seek(0)
-
+    buf = BytesIO(("\n".join(sites) + "\n").encode("utf-8"))
+    buf.seek(0)
     await update.message.reply_document(
-        document=outbuf, filename="urls.txt",
-        caption=f"✅ Processed {len(pairs)} URL(s) from your file."
+        document=buf, filename="urls.txt",
+        caption=f"✅ Extracted {len(sites)} clean site(s) from your file."
     )
-
 
 # Register handlers
 application.add_handler(CommandHandler("start", start_cmd))
 application.add_handler(CommandHandler("help", help_cmd))
 application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
 
 # ----------------------------
 # Flask routes
@@ -205,10 +192,8 @@ def telegram_webhook():
     if not update_json:
         abort(400)
     update = Update.de_json(update_json, application.bot)
-    # hand off to PTB's async app
     asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
     return "OK", 200
-
 
 # ----------------------------
 # Start PTB event loop thread + auto set webhook
@@ -217,7 +202,6 @@ def _run_bot():
     asyncio.set_event_loop(_loop)
     _loop.run_until_complete(application.initialize())
     _loop.run_until_complete(application.start())
-    # set webhook if we have a base URL
     if WEB_BASE_URL:
         webhook_url = f"{WEB_BASE_URL}/webhook/{BOT_TOKEN}"
         async def _set_hook():
@@ -232,11 +216,9 @@ def _run_bot():
 
 threading.Thread(target=_run_bot, daemon=True).start()
 
-
 # ----------------------------
 # Local run
 # ----------------------------
 if __name__ == "__main__":
-    # For local tests (set WEB_BASE_URL to your public tunnel, e.g. ngrok)
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
