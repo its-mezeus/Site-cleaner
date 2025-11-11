@@ -14,27 +14,42 @@ from telegram.ext import (
 )
 import tldextract
 
-# --- Config ---
+# ----------------------------
+# ENV VARIABLES
+# ----------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var")
 
-# --- Flask app ---
+if not RENDER_URL:
+    raise RuntimeError("Missing RENDER_EXTERNAL_URL env var (Render adds this automatically)")
+
+# ----------------------------
+# FLASK
+# ----------------------------
 app = Flask(__name__)
 
-# --- Telegram bot + dispatcher ---
+# ----------------------------
+# TELEGRAM BOT
+# ----------------------------
 bot = Bot(token=BOT_TOKEN)
 dispatcher = Dispatcher(bot=bot, update_queue=None, workers=0, use_context=True)
 
-# --- URL helpers ---
+WEBHOOK_URL = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
+
+# ----------------------------
+# URL HELPERS
+# ----------------------------
 URL_REGEX = re.compile(
     r'(?:(?:https?://)|(?:www\.))?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{2,5})?(?:/[^\s]*)?',
     re.IGNORECASE
 )
 
 def normalize_input_url(u: str) -> str:
-    """Ensure the URL has a scheme. If missing, add https://"""
-    u = u.strip()
+    """Ensure https:// exists (but leave path/query intact)."""
+    u = (u or "").strip()
     if not u:
         return ""
     if not re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://', u):
@@ -46,20 +61,17 @@ def to_apex_site(u: str) -> str:
     u = normalize_input_url(u)
     p = urlparse(u)
     host = p.hostname or ""
-
-    # handle localhost/IPs
+    # keep IP/localhost as-is
     if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", host) or host == "localhost":
         site = host
     else:
-        ext = tldextract.extract(host)
+        ext = tldextract.extract(host)  # (subdomain, domain, suffix)
         site = f"{ext.domain}.{ext.suffix}" if (ext.domain and ext.suffix) else host
     return f"https://{site}"
 
 def extract_urls(text: str):
     """Find URL-like strings and de-dup preserving order."""
-    if not text:
-        return []
-    matches = URL_REGEX.findall(text)
+    matches = URL_REGEX.findall(text or "")
     seen, out = set(), []
     for m in matches:
         s = m.strip()
@@ -75,32 +87,33 @@ def clean_pairs(text: str):
     - apex_site: https://<registrable-domain>
     De-duplicated by normalized_url.
     """
-    pairs, seen_norm = [], set()
+    pairs, seen = [], set()
     for u in extract_urls(text):
         norm = normalize_input_url(u)
-        if not norm or norm in seen_norm:
+        if not norm or norm in seen:
             continue
-        seen_norm.add(norm)
+        seen.add(norm)
         pairs.append((norm, to_apex_site(norm)))
     return pairs
 
-# --- Command handlers ---
+# ----------------------------
+# COMMAND HANDLERS
+# ----------------------------
 def start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "👋 *Welcome to the Site Cleaner Bot!*\n\n"
         "Send me:\n"
         "• Any text containing URLs\n"
         "• Or upload a `.txt` file with URLs\n\n"
-        "I will automatically:\n"
-        "✅ Detect all links\n"
+        "I will:\n"
         "✅ Add `https://` if missing\n"
-        "✅ Convert each to its clean site (apex domain)\n"
-        "✅ Return a tidy `urls.txt` mapping:\n"
+        "✅ Extract the clean apex domain\n"
+        "✅ Remove duplicates\n"
+        "✅ Return a `urls.txt` mapping:\n"
         "`<normalized>` -> `<site>`\n\n"
         "*Example:*\n"
         "`shop.amazon.co.uk/deal` → `https://amazon.co.uk`\n"
-        "`example.com/path` → `https://example.com`\n\n"
-        "Just send your text or `.txt` now!",
+        "`example.com/path` → `https://example.com`",
         parse_mode="Markdown"
     )
 
@@ -118,34 +131,37 @@ def help_command(update: Update, context: CallbackContext):
         parse_mode="Markdown"
     )
 
-# --- Message handlers ---
+# ----------------------------
+# MESSAGE HANDLERS
+# ----------------------------
 def handle_text(update: Update, context: CallbackContext):
-    msg = update.effective_message
-    pairs = clean_pairs(msg.text or "")
+    pairs = clean_pairs(update.message.text or "")
     if not pairs:
-        msg.reply_text("No URLs found.")
+        update.message.reply_text("No URLs found.")
         return
-    lines = [f"{norm} -> {site}" for (norm, site) in pairs]
+
+    lines = [f"{norm} -> {site}" for norm, site in pairs]
     buf = BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
     buf.seek(0)
-    msg.reply_document(document=buf, filename="urls.txt",
-                       caption=f"✅ Processed {len(pairs)} URL(s).")
+    update.message.reply_document(
+        document=buf, filename="urls.txt",
+        caption=f"✅ Processed {len(pairs)} URL(s)."
+    )
 
 def handle_document(update: Update, context: CallbackContext):
-    msg = update.effective_message
-    doc = msg.document
+    doc = update.message.document
     if not doc:
-        msg.reply_text("Please upload a `.txt` file.", parse_mode="Markdown")
+        update.message.reply_text("Please upload a `.txt` file.", parse_mode="Markdown")
         return
 
     is_txt_mime = (doc.mime_type or "").lower() == "text/plain"
     is_txt_name = (doc.file_name or "").lower().endswith(".txt")
     if not (is_txt_mime or is_txt_name):
-        msg.reply_text("Unsupported file type. Please upload a `.txt` file.", parse_mode="Markdown")
+        update.message.reply_text("Unsupported file type. Please upload a `.txt` file.", parse_mode="Markdown")
         return
 
     if doc.file_size and doc.file_size > 10 * 1024 * 1024:
-        msg.reply_text("File too large. Please upload a .txt under 10 MB.")
+        update.message.reply_text("File too large. Please upload a .txt under 10 MB.")
         return
 
     try:
@@ -154,41 +170,58 @@ def handle_document(update: Update, context: CallbackContext):
         file_obj.download(out=inbuf)
         content = inbuf.getvalue().decode("utf-8", errors="ignore")
     except Exception:
-        msg.reply_text("Couldn't read that file. Please try again.")
+        update.message.reply_text("Couldn't read that file. Please try again.")
         return
 
     pairs = clean_pairs(content)
     if not pairs:
-        msg.reply_text("No URLs found in your file.")
+        update.message.reply_text("No URLs found in your file.")
         return
 
     lines = [f"{norm} -> {site}" for (norm, site) in pairs]
     outbuf = BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
     outbuf.seek(0)
-    msg.reply_document(document=outbuf, filename="urls.txt",
-                       caption=f"✅ Processed {len(pairs)} URL(s) from your file.")
+    update.message.reply_document(
+        document=outbuf, filename="urls.txt",
+        caption=f"✅ Processed {len(pairs)} URL(s) from your file."
+    )
 
-# --- Register handlers ---
+# ----------------------------
+# REGISTER HANDLERS
+# ----------------------------
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("help", help_command))
-dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
 
-# --- Webhook endpoints (no auto setWebhook here) ---
+# ----------------------------
+# FLASK ROUTES
+# ----------------------------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-def telegram_webhook():
-    update_json = request.get_json(force=True, silent=True)
-    if not update_json:
+def webhook():
+    update_data = request.get_json(force=True, silent=True)
+    if not update_data:
         abort(400)
-    update = Update.de_json(update_json, bot)
+    update = Update.de_json(update_data, bot)
     dispatcher.process_update(update)
     return "OK", 200
 
-# Local dev (optional)
+# ----------------------------
+# AUTO SET WEBHOOK ON STARTUP
+# ----------------------------
+with app.app_context():
+    try:
+        bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        print("✅ Webhook set to:", WEBHOOK_URL)
+    except Exception as e:
+        print("❌ Failed to set webhook:", e)
+
+# ----------------------------
+# LOCAL RUN
+# ----------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(port=8000, host="0.0.0.0")
