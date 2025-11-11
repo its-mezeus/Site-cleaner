@@ -1,46 +1,47 @@
 import os
 import re
+import threading
+import asyncio
 from io import BytesIO
 from urllib.parse import urlparse
 
 from flask import Flask, request, abort
-from telegram import Bot, Update
-from telegram.ext import (
-    Dispatcher,
-    MessageHandler,
-    Filters,
-    CallbackContext,
-    CommandHandler,
-)
+
 import tldextract
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
 # ----------------------------
-# ENV VARIABLES
+# ENV
 # ----------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # Render sets this automatically
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var")
 
-if not RENDER_URL:
-    raise RuntimeError("Missing RENDER_EXTERNAL_URL env var (Render adds this automatically)")
+# If you're not on Render you can set WEB_BASE_URL manually (e.g. https://your-domain)
+WEB_BASE_URL = RENDER_URL or os.environ.get("WEB_BASE_URL", "")
 
 # ----------------------------
-# FLASK
+# Flask
 # ----------------------------
 app = Flask(__name__)
 
 # ----------------------------
-# TELEGRAM BOT
+# PTB v21 Application (async)
 # ----------------------------
-bot = Bot(token=BOT_TOKEN)
-dispatcher = Dispatcher(bot=bot, update_queue=None, workers=0, use_context=True)
+application = Application.builder().token(BOT_TOKEN).build()
 
-WEBHOOK_URL = f"{RENDER_URL}/webhook/{BOT_TOKEN}"
+# We'll run PTB's asyncio loop in a background thread
+_loop = asyncio.new_event_loop()
+
 
 # ----------------------------
-# URL HELPERS
+# URL helpers
 # ----------------------------
 URL_REGEX = re.compile(
     r'(?:(?:https?://)|(?:www\.))?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d{2,5})?(?:/[^\s]*)?',
@@ -48,7 +49,7 @@ URL_REGEX = re.compile(
 )
 
 def normalize_input_url(u: str) -> str:
-    """Ensure https:// exists (but leave path/query intact)."""
+    """Ensure https:// exists (leave path/query intact)."""
     u = (u or "").strip()
     if not u:
         return ""
@@ -61,7 +62,7 @@ def to_apex_site(u: str) -> str:
     u = normalize_input_url(u)
     p = urlparse(u)
     host = p.hostname or ""
-    # keep IP/localhost as-is
+    # Keep IP/localhost as-is
     if re.match(r"^(\d{1,3}\.){3}\d{1,3}$", host) or host == "localhost":
         site = host
     else:
@@ -96,11 +97,12 @@ def clean_pairs(text: str):
         pairs.append((norm, to_apex_site(norm)))
     return pairs
 
+
 # ----------------------------
-# COMMAND HANDLERS
+# Handlers (async)
 # ----------------------------
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "👋 *Welcome to the Site Cleaner Bot!*\n\n"
         "Send me:\n"
         "• Any text containing URLs\n"
@@ -109,119 +111,132 @@ def start(update: Update, context: CallbackContext):
         "✅ Add `https://` if missing\n"
         "✅ Extract the clean apex domain\n"
         "✅ Remove duplicates\n"
-        "✅ Return a `urls.txt` mapping:\n"
-        "`<normalized>` -> `<site>`\n\n"
-        "*Example:*\n"
-        "`shop.amazon.co.uk/deal` → `https://amazon.co.uk`\n"
-        "`example.com/path` → `https://example.com`",
-        parse_mode="Markdown"
+        "✅ Return a `urls.txt` mapping like:\n"
+        "`https://example.com/path -> https://example.com`",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-def help_command(update: Update, context: CallbackContext):
-    update.message.reply_text(
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "📖 *How to Use*\n\n"
-        "1) Send any message with links, or upload a `.txt` file (≤10MB)\n"
+        "1) Send text with links OR upload a `.txt` file (≤10MB)\n"
         "2) I will:\n"
         "   • Add `https://` if missing\n"
         "   • Clean to main domain (apex)\n"
         "   • Remove duplicates\n"
         "   • Reply with `urls.txt`\n\n"
         "*Example:*\n"
-        "`https://bsteessublimationink.com/product/123` → `https://bsteessublimationink.com`\n",
-        parse_mode="Markdown"
+        "`shop.amazon.co.uk/book` → `https://amazon.co.uk`",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-# ----------------------------
-# MESSAGE HANDLERS
-# ----------------------------
-def handle_text(update: Update, context: CallbackContext):
-    pairs = clean_pairs(update.message.text or "")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    pairs = clean_pairs(text)
     if not pairs:
-        update.message.reply_text("No URLs found.")
+        await update.message.reply_text("No URLs found.")
         return
 
-    lines = [f"{norm} -> {site}" for norm, site in pairs]
+    lines = [f"{norm} -> {site}" for (norm, site) in pairs]
     buf = BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
     buf.seek(0)
-    update.message.reply_document(
+
+    await update.message.reply_document(
         document=buf, filename="urls.txt",
         caption=f"✅ Processed {len(pairs)} URL(s)."
     )
 
-def handle_document(update: Update, context: CallbackContext):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:
-        update.message.reply_text("Please upload a `.txt` file.", parse_mode="Markdown")
+        await update.message.reply_text("Please upload a `.txt` file.", parse_mode=ParseMode.MARKDOWN)
         return
 
     is_txt_mime = (doc.mime_type or "").lower() == "text/plain"
     is_txt_name = (doc.file_name or "").lower().endswith(".txt")
     if not (is_txt_mime or is_txt_name):
-        update.message.reply_text("Unsupported file type. Please upload a `.txt` file.", parse_mode="Markdown")
+        await update.message.reply_text("Unsupported file type. Please upload a `.txt` file.", parse_mode=ParseMode.MARKDOWN)
         return
 
     if doc.file_size and doc.file_size > 10 * 1024 * 1024:
-        update.message.reply_text("File too large. Please upload a .txt under 10 MB.")
+        await update.message.reply_text("File too large. Please upload a .txt under 10 MB.")
         return
 
     try:
-        file_obj = context.bot.get_file(doc.file_id)
-        inbuf = BytesIO()
-        file_obj.download(out=inbuf)
-        content = inbuf.getvalue().decode("utf-8", errors="ignore")
+        file = await context.bot.get_file(doc.file_id)
+        data = await file.download_as_bytearray()
+        content = data.decode("utf-8", errors="ignore")
     except Exception:
-        update.message.reply_text("Couldn't read that file. Please try again.")
+        await update.message.reply_text("Couldn't read that file. Please try again.")
         return
 
     pairs = clean_pairs(content)
     if not pairs:
-        update.message.reply_text("No URLs found in your file.")
+        await update.message.reply_text("No URLs found in your file.")
         return
 
     lines = [f"{norm} -> {site}" for (norm, site) in pairs]
     outbuf = BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
     outbuf.seek(0)
-    update.message.reply_document(
+
+    await update.message.reply_document(
         document=outbuf, filename="urls.txt",
         caption=f"✅ Processed {len(pairs)} URL(s) from your file."
     )
 
-# ----------------------------
-# REGISTER HANDLERS
-# ----------------------------
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("help", help_command))
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
-dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
+
+# Register handlers
+application.add_handler(CommandHandler("start", start_cmd))
+application.add_handler(CommandHandler("help", help_cmd))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
 
 # ----------------------------
-# FLASK ROUTES
+# Flask routes
 # ----------------------------
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
 
 @app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    update_data = request.get_json(force=True, silent=True)
-    if not update_data:
+def telegram_webhook():
+    update_json = request.get_json(force=True, silent=True)
+    if not update_json:
         abort(400)
-    update = Update.de_json(update_data, bot)
-    dispatcher.process_update(update)
+    update = Update.de_json(update_json, application.bot)
+    # hand off to PTB's async app
+    asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
     return "OK", 200
 
-# ----------------------------
-# AUTO SET WEBHOOK ON STARTUP
-# ----------------------------
-with app.app_context():
-    try:
-        bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-        print("✅ Webhook set to:", WEBHOOK_URL)
-    except Exception as e:
-        print("❌ Failed to set webhook:", e)
 
 # ----------------------------
-# LOCAL RUN
+# Start PTB event loop thread + auto set webhook
+# ----------------------------
+def _run_bot():
+    asyncio.set_event_loop(_loop)
+    _loop.run_until_complete(application.initialize())
+    _loop.run_until_complete(application.start())
+    # set webhook if we have a base URL
+    if WEB_BASE_URL:
+        webhook_url = f"{WEB_BASE_URL}/webhook/{BOT_TOKEN}"
+        async def _set_hook():
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+                print("✅ Webhook set to:", webhook_url, flush=True)
+            except Exception as e:
+                print("❌ Failed to set webhook:", e, flush=True)
+        _loop.run_until_complete(_set_hook())
+    _loop.run_forever()
+
+threading.Thread(target=_run_bot, daemon=True).start()
+
+
+# ----------------------------
+# Local run
 # ----------------------------
 if __name__ == "__main__":
-    app.run(port=8000, host="0.0.0.0")
+    # For local tests (set WEB_BASE_URL to your public tunnel, e.g. ngrok)
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
