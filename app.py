@@ -39,8 +39,8 @@ _loop = asyncio.new_event_loop()
 # ----------------------------
 # Modes
 # ----------------------------
-# Save per-chat mode in application.bot_data["modes"] as {chat_id: "apex"|"host"}
-DEFAULT_MODE = "apex"  # "apex" collapses to registrable; "host" keeps subdomain
+DEFAULT_MODE = "apex"  # "apex" collapses to registrable; "host" keeps subdomains
+
 def _get_mode(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
     modes = context.application.bot_data.setdefault("modes", {})
     return modes.get(chat_id, DEFAULT_MODE)
@@ -258,7 +258,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Register handlers
 application.add_handler(CommandHandler("start", start_cmd))
 application.add_handler(CommandHandler("help", help_cmd))
-application.add_handler(CommandHandler("mode", mode_cmd)))
+application.add_handler(CommandHandler("mode", mode_cmd))  # <-- FIXED: removed extra ')'
 application.add_handler(CommandHandler("settings", settings_cmd))
 application.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^mode:(apex|host)$"))
 application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
