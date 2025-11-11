@@ -8,10 +8,11 @@ from urllib.parse import urlparse
 from flask import Flask, request, abort
 
 import tldextract
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
 # ----------------------------
@@ -34,6 +35,19 @@ app = Flask(__name__)
 # ----------------------------
 application = Application.builder().token(BOT_TOKEN).build()
 _loop = asyncio.new_event_loop()
+
+# ----------------------------
+# Modes
+# ----------------------------
+# Save per-chat mode in application.bot_data["modes"] as {chat_id: "apex"|"host"}
+DEFAULT_MODE = "apex"  # "apex" collapses to registrable; "host" keeps subdomain
+def _get_mode(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    modes = context.application.bot_data.setdefault("modes", {})
+    return modes.get(chat_id, DEFAULT_MODE)
+
+def _set_mode(context: ContextTypes.DEFAULT_TYPE, chat_id: int, mode: str):
+    modes = context.application.bot_data.setdefault("modes", {})
+    modes[chat_id] = mode
 
 # ----------------------------
 # URL helpers
@@ -65,6 +79,15 @@ def to_apex_site(u: str) -> str:
         site = f"{ext.domain}.{ext.suffix}" if (ext.domain and ext.suffix) else host
     return f"https://{site}"
 
+def to_host_site(u: str) -> str:
+    """Return https://<full-hostname> (keeps subdomains) and strips path/query."""
+    u = normalize_input_url(u)
+    p = urlparse(u)
+    host = p.hostname or ""
+    if not host:
+        return ""
+    return f"https://{host}"
+
 def extract_urls(text: str):
     """Find URL-like strings and de-dup preserving order."""
     matches = URL_REGEX.findall(text or "")
@@ -76,25 +99,37 @@ def extract_urls(text: str):
             out.append(s)
     return out
 
-def clean_sites(text: str):
+def clean_sites(text: str, mode: str):
     """
-    Returns a de-duplicated list of apex sites as https://<domain>.
-    Example output lines:
-      https://example.com
-      https://amazon.co.uk
+    Returns a de-duplicated list of sites as https://<domain>.
+    mode = "apex" (registrable) or "host" (keep subdomain).
     """
     sites, seen = [], set()
     for u in extract_urls(text):
-        site = to_apex_site(u)
+        site = to_apex_site(u) if mode == "apex" else to_host_site(u)
         if site and site not in seen:
             seen.add(site)
             sites.append(site)
     return sites
 
 # ----------------------------
+# Keyboards
+# ----------------------------
+def settings_keyboard(curr_mode: str) -> InlineKeyboardMarkup:
+    is_apex = (curr_mode == "apex")
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(("✅ Apex (current)" if is_apex else "Apex"), callback_data="mode:apex"),
+            InlineKeyboardButton(("✅ Host (current)" if not is_apex else "Host"), callback_data="mode:host"),
+        ]
+    ])
+
+# ----------------------------
 # Handlers (async)
 # ----------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mode = _get_mode(context, chat_id)
     await update.message.reply_text(
         "👋 *Welcome to the Site Cleaner Bot!*\n\n"
         "Send me:\n"
@@ -102,42 +137,89 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Or upload a `.txt` file with URLs\n\n"
         "I will:\n"
         "✅ Add `https://` if missing\n"
-        "✅ Trim each link to the clean site (apex domain)\n"
+        f"✅ Clean links to *{'apex domain' if mode=='apex' else 'full host (with subdomain)'}*\n"
         "✅ Remove duplicates\n"
-        "✅ Return a `urls.txt` with *one clean site per line*.\n\n"
-        "*Example:*\n"
-        "`https://zero936.com/abc` → `https://zero936.com`",
-        parse_mode=ParseMode.MARKDOWN
+        "✅ Return a `urls.txt` with one site per line\n\n"
+        f"Current mode: *{mode.upper()}*\n"
+        "Change it anytime with /mode or /settings",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=settings_keyboard(mode)
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mode = _get_mode(context, chat_id)
     await update.message.reply_text(
         "📖 *How to Use*\n\n"
         "1) Send text with links OR upload a `.txt` file (≤10MB)\n"
-        "2) I will:\n"
-        "   • Normalize with `https://` if missing\n"
-        "   • Collapse to the apex domain\n"
-        "   • De-duplicate\n"
-        "   • Reply with `urls.txt` (one domain per line)\n\n"
-        "*Example output:*\n"
-        "`https://zero936.com`",
-        parse_mode=ParseMode.MARKDOWN
+        "2) I will normalize with `https://` and clean each link to a site\n"
+        "3) Output is a neat `urls.txt` (one per line)\n\n"
+        "*Modes:*\n"
+        "• `apex` → `https://shop.amazon.co.uk/abc` → `https://amazon.co.uk`\n"
+        "• `host` → `https://shop.amazon.co.uk/abc` → `https://shop.amazon.co.uk`\n\n"
+        f"Current mode: *{mode.upper()}*\n"
+        "Use `/mode apex` or `/mode host`, or tap below:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=settings_keyboard(mode)
     )
 
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    arg = (context.args[0].lower() if context.args else "").strip()
+    if arg not in {"apex", "host"}:
+        await update.message.reply_text(
+            "Usage: `/mode apex` or `/mode host`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    _set_mode(context, chat_id, arg)
+    await update.message.reply_text(
+        f"✅ Mode set to *{arg.upper()}*.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=settings_keyboard(arg)
+    )
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mode = _get_mode(context, chat_id)
+    await update.message.reply_text(
+        f"Choose output mode (current: *{mode.upper()}*):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=settings_keyboard(mode)
+    )
+
+async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data or ""
+    if data.startswith("mode:"):
+        new_mode = data.split(":", 1)[1]
+        if new_mode in {"apex", "host"}:
+            _set_mode(context, chat_id, new_mode)
+            await query.edit_message_text(
+                f"✅ Mode set to *{new_mode.upper()}*.\n\n"
+                "Send text or a `.txt` file and I’ll return a clean list.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sites = clean_sites(update.message.text or "")
+    chat_id = update.effective_chat.id
+    mode = _get_mode(context, chat_id)
+    sites = clean_sites(update.message.text or "", mode)
     if not sites:
         await update.message.reply_text("No site URLs found.")
         return
-
     buf = BytesIO(("\n".join(sites) + "\n").encode("utf-8"))
     buf.seek(0)
     await update.message.reply_document(
         document=buf, filename="urls.txt",
-        caption=f"✅ Extracted {len(sites)} clean site(s)."
+        caption=f"✅ Extracted {len(sites)} {'apex' if mode=='apex' else 'host'} site(s)."
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mode = _get_mode(context, chat_id)
     doc = update.message.document
     if not doc:
         await update.message.reply_text("Please upload a `.txt` file.", parse_mode=ParseMode.MARKDOWN)
@@ -161,7 +243,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Couldn't read that file. Please try again.")
         return
 
-    sites = clean_sites(content)
+    sites = clean_sites(content, mode)
     if not sites:
         await update.message.reply_text("No site URLs found in your file.")
         return
@@ -170,12 +252,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf.seek(0)
     await update.message.reply_document(
         document=buf, filename="urls.txt",
-        caption=f"✅ Extracted {len(sites)} clean site(s) from your file."
+        caption=f"✅ Extracted {len(sites)} {'apex' if mode=='apex' else 'host'} site(s) from your file."
     )
 
 # Register handlers
 application.add_handler(CommandHandler("start", start_cmd))
 application.add_handler(CommandHandler("help", help_cmd))
+application.add_handler(CommandHandler("mode", mode_cmd)))
+application.add_handler(CommandHandler("settings", settings_cmd))
+application.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^mode:(apex|host)$"))
 application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -196,7 +281,7 @@ def telegram_webhook():
     return "OK", 200
 
 # ----------------------------
-# Start PTB event loop thread + auto set webhook
+# Start PTB loop thread + auto set webhook
 # ----------------------------
 def _run_bot():
     asyncio.set_event_loop(_loop)
