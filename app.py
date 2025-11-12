@@ -1,10 +1,11 @@
-# app.py (Option A: Manual /clean mode)
+# app.py (Manual /clean mode) - corrected imports
 import os
 import re
 import threading
 import asyncio
 from io import BytesIO
-from urllib.parse import urlparse, splitext
+from urllib.parse import urlparse
+from os.path import splitext
 
 from flask import Flask, request, abort
 
