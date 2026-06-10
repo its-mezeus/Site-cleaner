@@ -151,6 +151,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scr - Scrape CCs from group/channel\n"
         "/merge - Combine multiple files\n"
         "/split - Split a file by lines\n"
+        "/session - Change scraper session (admin)\n"
         "/mode - Switch Apex / Host mode\n"
         "/help - How to use this bot",
         parse_mode=ParseMode.MARKDOWN,
@@ -160,7 +161,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
             ],
             [
-                InlineKeyboardButton("👤 Owner", url="https://t.me/ZEUS_IS_HERE2"),
+                InlineKeyboardButton("👤 Owner", url="https://t.me/SUPERSTAR_AJP"),
             ]
         ])
     )
@@ -404,26 +405,118 @@ async def cclean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------
 _pyro_client = None
 _pyro_lock = asyncio.Lock()
+_dynamic_session = SCRAPER_SESSION  # can be changed at runtime via /session
+_pyro_user_info = None  # cache: (first_name, user_id)
 scrape_cancelled = {}  # chat_id -> True when cancelled
 
 async def _get_pyro():
     """Get or create Pyrogram client (lazy init, runs in _loop)."""
-    global _pyro_client
+    global _pyro_client, _pyro_user_info
     if _pyro_client and _pyro_client.is_connected:
         return _pyro_client
-    if not all([SCRAPER_API_ID, SCRAPER_API_HASH, SCRAPER_SESSION]):
+    if not all([SCRAPER_API_ID, SCRAPER_API_HASH, _dynamic_session]):
         return None
     _pyro_client = PyroClient(
         "scraper_user",
         api_id=SCRAPER_API_ID,
         api_hash=SCRAPER_API_HASH,
-        session_string=SCRAPER_SESSION,
+        session_string=_dynamic_session,
         no_updates=True,
+        in_memory=True,
     )
     await _pyro_client.start()
     me = await _pyro_client.get_me()
-    print(f"✅ Scraper userbot: {me.first_name}", flush=True)
+    _pyro_user_info = (me.first_name, me.id)
+    print(f"✅ Scraper userbot: {me.first_name} (ID: {me.id})", flush=True)
     return _pyro_client
+
+async def _disconnect_pyro():
+    """Disconnect current Pyrogram client."""
+    global _pyro_client, _pyro_user_info
+    if _pyro_client:
+        try:
+            if _pyro_client.is_connected:
+                await _pyro_client.stop()
+        except Exception:
+            pass
+        _pyro_client = None
+        _pyro_user_info = None
+
+async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Change or view scraper session string. Admin only."""
+    global _dynamic_session
+
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    args = context.args or []
+
+    # /session — show current status
+    if not args:
+        if _pyro_client and _pyro_client.is_connected and _pyro_user_info:
+            name, uid = _pyro_user_info
+            masked = _dynamic_session[:10] + "..." + _dynamic_session[-10:] if _dynamic_session else "None"
+            await update.message.reply_text(
+                f"✅ *Scraper session active*\n\n"
+                f"👤 Connected as: *{name}*\n"
+                f"🆔 User ID: `{uid}`\n"
+                f"🔑 Session: `{masked}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        elif _dynamic_session:
+            await update.message.reply_text(
+                "⚠️ Session string set but not connected.\n\nRun `/scr` to connect, or set a new one with:\n`/session <new_session_string>`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text(
+                "❌ No session string set.\n\nSet one with:\n`/session <session_string>`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return
+
+    # /session clear — disconnect and clear
+    if args[0].lower() == "clear":
+        await _disconnect_pyro()
+        _dynamic_session = ""
+        await update.message.reply_text("✅ Session cleared and disconnected.")
+        return
+
+    # /session <new_session_string> — set new session
+    new_session = args[0].strip()
+    if len(new_session) < 50:
+        await update.message.reply_text("❌ That doesn't look like a valid session string.")
+        return
+
+    # Disconnect old client
+    await _disconnect_pyro()
+    _dynamic_session = new_session
+
+    # Try connecting with new session
+    try:
+        # Delete the user's message (contains session string)
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        pyro = await _get_pyro()
+        if pyro and _pyro_user_info:
+            name, uid = _pyro_user_info
+            await update.effective_chat.send_message(
+                f"✅ *New session connected!*\n\n"
+                f"👤 Connected as: *{name}*\n"
+                f"🆔 User ID: `{uid}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.effective_chat.send_message("❌ Failed to connect with that session string.")
+            _dynamic_session = ""
+    except Exception as e:
+        await update.effective_chat.send_message(f"❌ Connection failed: `{str(e)[:200]}`", parse_mode=ParseMode.MARKDOWN)
+        _dynamic_session = ""
 
 # CC extraction regex for scraping (same pattern)
 SCRAPE_CC_PATTERN = re.compile(
@@ -439,24 +532,25 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Admin only.")
         return
 
-    # Parse args: /scr <link_or_id> <count>
+    # Parse args: /scr <link_or_id> <count> <bin>
     args = context.args or []
     if len(args) < 1:
         await update.message.reply_text(
-            "📌 *Usage:*\n`/scr <link or ID> <max_ccs>`\n\n"
+            "📌 *Usage:*\n`/scr <link or ID> <max_ccs> <bin>`\n\n"
             "*Examples:*\n"
-            "`/scr @channelname 5000`\n"
-            "`/scr https://t.me/groupname 10000`\n"
-            "`/scr https://t.me/c/123456/89420 500`\n"
-            "`/scr -1001234567890 5000`\n\n"
-            "Copy any message link from a channel to identify it.\n"
-            "If no count given, defaults to all available.",
+            "`/scr @channelname` — scrape all CCs\n"
+            "`/scr @channelname 5000` — max 5000 CCs\n"
+            "`/scr @channelname 0 534456` — all CCs with BIN 534456\n"
+            "`/scr https://t.me/c/123456/89420 500 4512` — max 500, BIN 4512\n\n"
+            "BIN filter: only keeps cards starting with that prefix (4-8 digits).\n"
+            "Use `0` for max\\_ccs to scrape all with a BIN filter.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     target = args[0]
     max_ccs = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0  # 0 = no limit
+    bin_filter = args[2] if len(args) > 2 and args[2].isdigit() and 4 <= len(args[2]) <= 8 else None
 
     # Get pyrogram client
     pyro = await _get_pyro()
@@ -606,8 +700,9 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     scrape_cancelled.pop(user_chat_id, None)  # reset
 
+    bin_info = f"\n🔢 BIN filter: `{bin_filter}`" if bin_filter else ""
     progress = await update.message.reply_text(
-        f"🔍 Scraping *{chat_title}*...\n\n"
+        f"🔍 Scraping *{chat_title}*...{bin_info}\n\n"
         f"⏳ This may take a while for large groups.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=cancel_kb,
@@ -655,6 +750,10 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if max_ccs and len(valid_ccs) >= max_ccs:
                     break
 
+                # BIN filter
+                if bin_filter and not card_num.startswith(bin_filter):
+                    continue
+
                 month = int(mm)
                 if month < 1 or month > 12:
                     continue
@@ -668,16 +767,8 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if is_expired(month, year):
                     continue
 
-                brand = identify_card_brand(card_num)
-                if not brand:
-                    continue
-
-                if not luhn_check(card_num):
-                    continue
-
-                if brand == "AMEX" and len(cvv) != 4:
-                    continue
-                if brand != "AMEX" and len(cvv) != 3:
+                # CVV basic check (3 or 4 digits)
+                if len(cvv) not in (3, 4):
                     continue
 
                 if card_num in seen:
@@ -700,24 +791,26 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    bin_line = f"\n🔢 BIN filter: `{bin_filter}`" if bin_filter else ""
     if not valid_ccs:
         await update.message.reply_text(
-            f"❌ No valid CCs found in *{chat_title}*\n\n"
+            f"❌ No valid CCs found in *{chat_title}*{bin_line}\n\n"
             f"📨 Messages scanned: *{messages_scanned}*",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     status = "⚠️ *Scrape Cancelled*" if was_cancelled else "✅ *Scrape Complete!*"
+    fname = f"scraped_{chat.id}_{bin_filter}.txt" if bin_filter else f"scraped_{chat.id}.txt"
     buf = BytesIO(("\n".join(valid_ccs) + "\n").encode("utf-8"))
     buf.seek(0)
     await update.message.reply_document(
-        document=buf, filename=f"scraped_{chat.id}.txt",
+        document=buf, filename=fname,
         caption=(
             f"{status}\n\n"
             f"📢 Source: *{chat_title}*\n"
             f"📨 Messages scanned: *{messages_scanned}*\n"
-            f"💳 Valid CCs: *{len(valid_ccs)}*"
+            f"💳 Valid CCs: *{len(valid_ccs)}*{bin_line}"
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -940,7 +1033,7 @@ async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
                 ],
                 [
-                    InlineKeyboardButton("👤 Owner", url="https://t.me/ZEUS_IS_HERE2"),
+                    InlineKeyboardButton("👤 Owner", url="https://t.me/SUPERSTAR_AJP"),
                 ]
             ])
         )
@@ -1191,6 +1284,7 @@ application.add_handler(CommandHandler("clean", clean_cmd))
 application.add_handler(CommandHandler("cclean", cclean_cmd))
 application.add_handler(CommandHandler("split", split_cmd))
 application.add_handler(CommandHandler("scr", scr_cmd))
+application.add_handler(CommandHandler("session", session_cmd))
 application.add_handler(CommandHandler("mode", mode_cmd))
 application.add_handler(CommandHandler("merge", merge_cmd))
 application.add_handler(CommandHandler("settings", settings_cmd))
